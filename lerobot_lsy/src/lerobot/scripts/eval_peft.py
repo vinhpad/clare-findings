@@ -222,6 +222,12 @@ def rollout(
         # available of none of the envs finished.
         if "final_info" in info:
             successes = [info["is_success"] if info is not None else False for info in info["final_info"]]
+        elif "is_success" in info:
+            # FFI26 patch: gymnasium >= 1.0 returns no "final_info"; each env's info is merged into arrays,
+            # with "_is_success" marking the envs that reported it at this step.
+            successes = (
+                np.asarray(info["is_success"], dtype=bool) & np.asarray(info.get("_is_success", True), dtype=bool)
+            ).tolist()
         else:
             successes = [False] * env.num_envs
 

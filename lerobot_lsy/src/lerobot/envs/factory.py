@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import importlib
+import os
 
 import gymnasium as gym
 
@@ -33,6 +34,37 @@ def make_env_config(env_type: str, **kwargs) -> EnvConfig:
         return HILEnvConfig(**kwargs)
     else:
         raise ValueError(f"Policy type '{env_type}' is not available.")
+
+
+class _FreezeWhenDone(gym.Wrapper):
+    """FFI26 patch: once an episode has terminated or been truncated, return its last transition instead of
+    stepping the simulator. Evaluation rollouts ignore everything after an env's first done step, so results
+    are unchanged, but a batch no longer simulates every finished env until the slowest one is done."""
+
+    def reset(self, **kwargs):
+        if not kwargs and getattr(self, "_last", None) is not None:
+            # Autoreset by the vector env (it calls reset() without arguments) after this episode ended: stay
+            # frozen. A new batch resets with seed=..., which starts a real episode.
+            obs, _, _, _, info = self._last
+            return obs, info
+        self._last = None
+        return self.env.reset(**kwargs)
+
+    @property
+    def _init_state_id(self):  # the eval rollout reads and advances it through the wrapper chain
+        return self.env._init_state_id
+
+    @_init_state_id.setter
+    def _init_state_id(self, value):
+        self.env._init_state_id = value
+
+    def step(self, action):
+        if getattr(self, "_last", None) is not None:
+            return self._last
+        transition = self.env.step(action)
+        if transition[2] or transition[3]:
+            self._last = transition
+        return transition
 
 
 def make_env(cfg: EnvConfig, n_envs: int = 1, use_async_envs: bool = False) -> gym.vector.VectorEnv | None:
@@ -66,8 +98,20 @@ def make_env(cfg: EnvConfig, n_envs: int = 1, use_async_envs: bool = False) -> g
 
     # batched version of the env that returns an observation of shape (b, c)
     env_cls = gym.vector.AsyncVectorEnv if use_async_envs else gym.vector.SyncVectorEnv
-    env = env_cls(
-        [lambda: gym.make(gym_handle, disable_env_checker=True, **cfg.gym_kwargs) for _ in range(n_envs)]
-    )
+    # FFI26 patch: finished envs return their last transition instead of simulating on (see _FreezeWhenDone).
+    freeze = os.environ.get("CLARE_FREEZE_DONE", "1") != "0"
+
+    def make_one():
+        one = gym.make(gym_handle, disable_env_checker=True, **cfg.gym_kwargs)
+        if freeze:
+            # Insert right above the raw env, below gym.make's wrappers (TimeLimit, OrderEnforcing): the eval
+            # rollout reads env.envs[i].env.env._init_state_id, so the wrapper depth must stay the same.
+            parent = one
+            while isinstance(parent.env, gym.Wrapper):
+                parent = parent.env
+            parent.env = _FreezeWhenDone(parent.env)
+        return one
+
+    env = env_cls([make_one for _ in range(n_envs)])
 
     return env
