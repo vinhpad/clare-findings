@@ -9,6 +9,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import copy
+import os
 from collections import deque
 
 import einops
@@ -632,6 +633,43 @@ class DiTFlowModel(nn.Module):
         )
         return sample
 
+    def _encode_images(self, batch, images, batch_size, n_obs_steps):
+        """FFI26 patch: DINOv2 CLS tokens, cached per dataset frame during training.
+
+        DINOv2 is frozen and training images are not augmented, so a frame always gives the same token. Keys are
+        the dataset indices of the observed frames, clamped to the episode start as LeRobot pads them. Batches
+        without a dataset index (environment rollouts) always run DINOv2.
+        """
+        if os.environ.get("CLARE_FEATURE_CACHE", "1") == "0" or "index" not in batch or "frame_index" not in batch:
+            return self.pretrained_rgb_encoder(images)
+        n_cams = len(self.config.image_features)
+        index = batch["index"].reshape(-1).long()
+        start = index - batch["frame_index"].reshape(-1).long()
+        offsets = torch.tensor(self.config.observation_delta_indices, device=index.device)
+        keys = torch.maximum(index[:, None] + offsets[None], start[:, None]).reshape(-1)  # (b*s,)
+
+        cache = getattr(self, "_cls_cache", None)
+        if cache is not None and cache[0].is_inference() and not torch.is_inference_mode_enabled():
+            # Filled under torch.inference_mode (novelty detection); training cannot write into such tensors.
+            cache = self._cls_cache = (cache[0].clone(), cache[1].clone())
+        if cache is None or cache[0].shape[0] <= int(keys.max()):
+            size = max(int(keys.max()) + 1, 2 * (0 if cache is None else cache[0].shape[0]))
+            feats = torch.zeros(size, n_cams, self.pretrained_rgb_encoder.hidden_size, device=index.device)
+            filled = torch.zeros(size, dtype=torch.bool, device=index.device)
+            if cache is not None:
+                feats[: cache[0].shape[0]] = cache[0]
+                filled[: cache[1].shape[0]] = cache[1]
+            cache = self._cls_cache = (feats, filled)
+        feats, filled = cache
+
+        missing = ~filled[keys]
+        if missing.any():
+            per_frame = images.reshape(batch_size * n_obs_steps, n_cams, *images.shape[1:])[missing]
+            tokens = self.pretrained_rgb_encoder(per_frame.flatten(0, 1))
+            feats[keys[missing]] = tokens.reshape(-1, n_cams, tokens.shape[-1]).to(feats.dtype)
+            filled[keys[missing]] = True
+        return feats[keys].reshape(-1, feats.shape[-1])  # (b s n) order, as the caller expects
+
     def _prepare_global_conditioning(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         """Encode image features and concatenate them all together along with the state vector."""
         batch_size, n_obs_steps = batch[OBS_ROBOT].shape[:2]
@@ -655,7 +693,7 @@ class DiTFlowModel(nn.Module):
         if self.config.image_features:
             images = einops.rearrange(batch["observation.images"], "b s n ... -> (b s n) ...", b=batch_size, s=n_obs_steps, n=len(self.config.image_features))
             with torch.no_grad():
-                img_cls_tokens = self.pretrained_rgb_encoder(images)
+                img_cls_tokens = self._encode_images(batch, images, batch_size, n_obs_steps)  # FFI26 patch
             img_embeddings = self.rgb_embedding_projection(img_cls_tokens)
             img_features = einops.rearrange(
                 img_embeddings, "(b s n) ... -> b s (n ...)", b=batch_size, s=n_obs_steps, n=len(self.config.image_features)
